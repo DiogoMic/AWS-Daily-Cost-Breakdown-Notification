@@ -1,0 +1,604 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Daily AWS cost breakdown Lambda function with EventBridge scheduler and SES notifications - Multi-region support'
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: 'Email address to receive daily cost breakdown reports (must be verified in SES)'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  TargetRegions:
+    Type: CommaDelimitedList
+    Description: 'Comma-separated list of AWS regions to monitor for costs'
+    Default: 'us-east-1,us-west-2,eu-west-1'
+
+  ScheduleExpression:
+    Type: String
+    Description: 'Cron expression for when to run the cost breakdown (default: daily at 07:00 UTC)'
+    Default: 'cron(0 7 * * ? *)'
+
+  LogRetentionDays:
+    Type: Number
+    Description: 'Number of days to retain CloudWatch logs'
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: 'Must be one of the allowed CloudWatch log retention values'
+
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: 'Optional: Security Group IDs for Lambda VPC configuration (leave empty for no VPC)'
+    Default: ''
+
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Description: 'Optional: Subnet IDs for Lambda VPC configuration (leave empty for no VPC)'
+    Default: ''
+
+  KmsKeyId:
+    Type: String
+    Description: 'Optional: KMS Key ARN for CloudWatch Logs encryption (leave empty to use default AWS managed key)'
+    Default: ''
+
+Conditions:
+  HasVpcConfig: !And
+    - !Not [!Equals [!Select [0, !Ref VpcSubnetIds], '']]
+    - !Not [!Equals [!Select [0, !Ref VpcSecurityGroupIds], '']]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyId, '']]
+
+Resources:
+  # IAM Role for Lambda Function
+  CostBreakdownLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !If
+          - HasVpcConfig
+          - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+          - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: CostExplorerAndSESPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetUsageReport
+                  - ce:GetDimensionValues
+                  - ce:GetReservationCoverage
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetReservationUtilization
+                  - ce:GetSavingsPlansUtilization
+                  - ce:ListCostCategoryDefinitions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${EmailAddress}'
+                  - !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
+
+  # CloudWatch Log Group
+  CostBreakdownLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/cost-breakdown-function
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If [HasKmsKey, !Ref KmsKeyId, !Ref 'AWS::NoValue']
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  # Lambda Function
+  CostBreakdownFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cost-breakdown-function
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CostBreakdownLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      VpcConfig: !If
+        - HasVpcConfig
+        - SecurityGroupIds: !Ref VpcSecurityGroupIds
+          SubnetIds: !Ref VpcSubnetIds
+        - !Ref 'AWS::NoValue'
+      Environment:
+        Variables:
+          EMAIL_ADDRESS: !Ref EmailAddress
+          TARGET_REGIONS: !Join [',', !Ref TargetRegions]
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          from typing import Dict, List, Any
+
+          # Initialize AWS clients
+          ce_client = boto3.client('ce')
+          ses_client = boto3.client('ses')
+
+          class DecimalEncoder(json.JSONEncoder):
+              """JSON encoder for Decimal objects from AWS Cost Explorer API"""
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def get_daily_cost_breakdown() -> Dict[str, Any]:
+              """
+              Fetch daily cost breakdown from AWS Cost Explorer API.
+              
+              Returns:
+                  Dict containing cost data by service and region, plus total cost
+              """
+              # Get yesterday's date (since today's costs might not be complete)
+              end_date = datetime.now().date()
+              start_date = end_date - timedelta(days=1)
+              
+              # Get target regions from environment variable
+              target_regions = os.environ.get('TARGET_REGIONS', 'us-east-1').split(',')
+              
+              print(f"Fetching cost data for {start_date} across regions: {target_regions}")
+              
+              try:
+                  # Get overall cost and usage data grouped by service
+                  overall_response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost', 'UnblendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {
+                              'Type': 'DIMENSION',
+                              'Key': 'SERVICE'
+                          }
+                      ]
+                  )
+                  
+                  # Get regional breakdown
+                  regional_response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost'],
+                      GroupBy=[
+                          {
+                              'Type': 'DIMENSION',
+                              'Key': 'REGION'
+                          }
+                      ],
+                      Filter={
+                          'Dimensions': {
+                              'Key': 'REGION',
+                              'Values': target_regions,
+                              'MatchOptions': ['EQUALS']
+                          }
+                      }
+                  )
+                  
+                  # Process the response
+                  cost_data = {
+                      'date': start_date.strftime('%Y-%m-%d'),
+                      'services': [],
+                      'regions': [],
+                      'total_cost': Decimal('0.00'),
+                      'target_regions': target_regions,
+                      'currency': 'USD'
+                  }
+                  
+                  # Process overall service costs
+                  if overall_response['ResultsByTime']:
+                      daily_result = overall_response['ResultsByTime'][0]
+                      
+                      # Extract service-level costs
+                      for group in daily_result.get('Groups', []):
+                          service_name = group['Keys'][0]
+                          blended_cost = Decimal(group['Metrics']['BlendedCost']['Amount'])
+                          unblended_cost = Decimal(group['Metrics']['UnblendedCost']['Amount'])
+                          usage_quantity = Decimal(group['Metrics']['UsageQuantity']['Amount'])
+                          
+                          # Only include services with non-zero costs
+                          if blended_cost > 0:
+                              cost_data['services'].append({
+                                  'service': service_name,
+                                  'blended_cost': blended_cost,
+                                  'unblended_cost': unblended_cost,
+                                  'usage_quantity': usage_quantity,
+                                  'currency': group['Metrics']['BlendedCost']['Unit']
+                              })
+                              cost_data['total_cost'] += blended_cost
+                      
+                      # Sort services by cost (highest first)
+                      cost_data['services'].sort(key=lambda x: x['blended_cost'], reverse=True)
+                  
+                  # Process regional costs
+                  if regional_response['ResultsByTime']:
+                      regional_result = regional_response['ResultsByTime'][0]
+                      
+                      for group in regional_result.get('Groups', []):
+                          region_name = group['Keys'][0]
+                          regional_cost = Decimal(group['Metrics']['BlendedCost']['Amount'])
+                          
+                          if regional_cost > 0:
+                              cost_data['regions'].append({
+                                  'region': region_name,
+                                  'cost': regional_cost,
+                                  'currency': group['Metrics']['BlendedCost']['Unit']
+                              })
+                      
+                      # Sort regions by cost (highest first)
+                      cost_data['regions'].sort(key=lambda x: x['cost'], reverse=True)
+                  
+                  print(f"Retrieved cost data for {len(cost_data['services'])} services across {len(cost_data['regions'])} regions")
+                  
+                  return cost_data
+                  
+              except Exception as e:
+                  print(f"Error fetching cost data: {str(e)}")
+                  raise
+
+          def format_cost_email(cost_data: Dict[str, Any]) -> Dict[str, str]:
+              """
+              Format cost data into HTML and text email content.
+              
+              Args:
+                  cost_data: Dictionary containing cost breakdown data
+                  
+              Returns:
+                  Dictionary with 'html' and 'text' email content
+              """
+              date = cost_data['date']
+              total_cost = cost_data['total_cost']
+              services = cost_data['services']
+              regions = cost_data['regions']
+              target_regions = cost_data['target_regions']
+              
+              # Create HTML email content
+              html_content = f"""
+              <html>
+              <head>
+                  <style>
+                      body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                      .header {{ background-color: #232F3E; color: white; padding: 20px; text-align: center; }}
+                      .summary {{ background-color: #f8f9fa; padding: 15px; margin: 20px 0; border-left: 4px solid #FF9900; }}
+                      .cost-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+                      .cost-table th, .cost-table td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+                      .cost-table th {{ background-color: #f2f2f2; font-weight: bold; }}
+                      .cost-table tr:nth-child(even) {{ background-color: #f9f9f9; }}
+                      .total-row {{ background-color: #e8f4f8; font-weight: bold; }}
+                      .section {{ margin: 30px 0; }}
+                      .footer {{ margin-top: 30px; padding: 15px; background-color: #f8f9fa; font-size: 12px; color: #666; }}
+                  </style>
+              </head>
+              <body>
+                  <div class="header">
+                      <h1>AWS Daily Cost Breakdown</h1>
+                      <p>Multi-Region Cost Report for {date}</p>
+                  </div>
+                  
+                  <div class="summary">
+                      <h2>Summary</h2>
+                      <p><strong>Total Daily Cost:</strong> ${total_cost:.2f} USD</p>
+                      <p><strong>Services with Charges:</strong> {len(services)}</p>
+                      <p><strong>Regions Monitored:</strong> {', '.join(target_regions)}</p>
+                      <p><strong>Regions with Costs:</strong> {len(regions)}</p>
+                      <p><strong>Report Date:</strong> {date}</p>
+                  </div>
+                  
+                  <div class="section">
+                      <h2>Cost Breakdown by Region</h2>
+                      <table class="cost-table">
+                          <thead>
+                              <tr>
+                                  <th>Region</th>
+                                  <th>Cost (USD)</th>
+                                  <th>% of Total</th>
+                              </tr>
+                          </thead>
+                          <tbody>
+              """
+              
+              # Add regional breakdown
+              for region in regions:
+                  percentage = (region['cost'] / total_cost * 100) if total_cost > 0 else 0
+                  html_content += f"""
+                              <tr>
+                                  <td>{region['region']}</td>
+                                  <td>${region['cost']:.2f}</td>
+                                  <td>{percentage:.1f}%</td>
+                              </tr>
+                  """
+              
+              html_content += """
+                          </tbody>
+                      </table>
+                  </div>
+                  
+                  <div class="section">
+                      <h2>Cost Breakdown by Service</h2>
+                      <table class="cost-table">
+                          <thead>
+                              <tr>
+                                  <th>Service</th>
+                                  <th>Blended Cost (USD)</th>
+                                  <th>Unblended Cost (USD)</th>
+                                  <th>Usage Quantity</th>
+                                  <th>% of Total</th>
+                              </tr>
+                          </thead>
+                          <tbody>
+              """
+              
+              # Add service rows
+              for service in services:
+                  percentage = (service['blended_cost'] / total_cost * 100) if total_cost > 0 else 0
+                  html_content += f"""
+                          <tr>
+                              <td>{service['service']}</td>
+                              <td>${service['blended_cost']:.2f}</td>
+                              <td>${service['unblended_cost']:.2f}</td>
+                              <td>{service['usage_quantity']:.2f}</td>
+                              <td>{percentage:.1f}%</td>
+                          </tr>
+                  """
+              
+              # Add total row
+              html_content += f"""
+                          <tr class="total-row">
+                              <td><strong>TOTAL</strong></td>
+                              <td><strong>${total_cost:.2f}</strong></td>
+                              <td><strong>-</strong></td>
+                              <td><strong>-</strong></td>
+                              <td><strong>100.0%</strong></td>
+                          </tr>
+                      </tbody>
+                  </table>
+                  </div>
+                  
+                  <div class="footer">
+                      <p>This report was generated automatically by your AWS Cost Breakdown Lambda function.</p>
+                      <p>Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+                      <p>Monitored regions: {', '.join(target_regions)}</p>
+                      <p>Note: Costs shown are for the previous day as current day costs may be incomplete.</p>
+                  </div>
+              </body>
+              </html>
+              """
+              
+              # Create text email content
+              text_content = f"""
+          AWS Daily Cost Breakdown - {date}
+          {'=' * 50}
+
+          SUMMARY:
+          Total Daily Cost: ${total_cost:.2f} USD
+          Services with Charges: {len(services)}
+          Regions Monitored: {', '.join(target_regions)}
+          Regions with Costs: {len(regions)}
+          Report Date: {date}
+
+          COST BREAKDOWN BY REGION:
+          {'Region':<20} {'Cost':<15} {'% of Total':<10}
+          {'-' * 50}
+          """
+              
+              for region in regions:
+                  percentage = (region['cost'] / total_cost * 100) if total_cost > 0 else 0
+                  text_content += f"{region['region']:<20} ${region['cost']:<14.2f} {percentage:<9.1f}%\n"
+              
+              text_content += f"""
+          COST BREAKDOWN BY SERVICE:
+          {'Service':<30} {'Blended Cost':<15} {'% of Total':<10}
+          {'-' * 60}
+          """
+              
+              for service in services:
+                  percentage = (service['blended_cost'] / total_cost * 100) if total_cost > 0 else 0
+                  text_content += f"{service['service']:<30} ${service['blended_cost']:<14.2f} {percentage:<9.1f}%\n"
+              
+              text_content += f"""
+          {'-' * 60}
+          {'TOTAL':<30} ${total_cost:<14.2f} {'100.0%':<9}
+
+          Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+          Monitored regions: {', '.join(target_regions)}
+          Note: Costs shown are for the previous day as current day costs may be incomplete.
+          """
+              
+              return {
+                  'html': html_content,
+                  'text': text_content
+              }
+
+          def send_cost_email(email_content: Dict[str, str], cost_data: Dict[str, Any]) -> None:
+              """
+              Send cost breakdown email via SES.
+              
+              Args:
+                  email_content: Dictionary with HTML and text email content
+                  cost_data: Cost data for subject line
+              """
+              email_address = os.environ['EMAIL_ADDRESS']
+              date = cost_data['date']
+              total_cost = cost_data['total_cost']
+              
+              subject = f"AWS Daily Cost Breakdown - {date} (${total_cost:.2f})"
+              
+              try:
+                  response = ses_client.send_email(
+                      Source=email_address,
+                      Destination={
+                          'ToAddresses': [email_address]
+                      },
+                      Message={
+                          'Subject': {
+                              'Data': subject,
+                              'Charset': 'UTF-8'
+                          },
+                          'Body': {
+                              'Text': {
+                                  'Data': email_content['text'],
+                                  'Charset': 'UTF-8'
+                              },
+                              'Html': {
+                                  'Data': email_content['html'],
+                                  'Charset': 'UTF-8'
+                              }
+                          }
+                      }
+                  )
+                  
+                  print(f"Email sent successfully. MessageId: {response['MessageId']}")
+                  
+              except Exception as e:
+                  print(f"Error sending email: {str(e)}")
+                  raise
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler function.
+              
+              Args:
+                  event: Lambda event data
+                  context: Lambda context object
+                  
+              Returns:
+                  Dictionary with execution results
+              """
+              print("Starting daily cost breakdown process")
+              print(f"Event: {json.dumps(event, cls=DecimalEncoder)}")
+              
+              try:
+                  # Fetch cost data
+                  cost_data = get_daily_cost_breakdown()
+                  
+                  # Format email content
+                  email_content = format_cost_email(cost_data)
+                  
+                  # Send email
+                  send_cost_email(email_content, cost_data)
+                  
+                  result = {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Cost breakdown email sent successfully',
+                          'date': cost_data['date'],
+                          'total_cost': float(cost_data['total_cost']),
+                          'services_count': len(cost_data['services'])
+                      }
+                  }
+                  
+                  print("Cost breakdown process completed successfully")
+                  return result
+                  
+              except Exception as e:
+                  print(f"Error in cost breakdown process: {str(e)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'message': 'Error processing cost breakdown',
+                          'error': str(e)
+                      }
+                  }
+      Description: 'Daily AWS cost breakdown function that sends email via SES with multi-region support'
+
+  # IAM Role for EventBridge Scheduler
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CostBreakdownFunction.Arn
+
+  # EventBridge Schedule
+  DailyCostBreakdownSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-daily-schedule'
+      Description: 'Triggers cost breakdown Lambda function daily'
+      ScheduleExpression: !Ref ScheduleExpression
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt CostBreakdownFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source": "eventbridge-scheduler"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+      State: ENABLED
+
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the cost breakdown Lambda function'
+    Value: !Ref CostBreakdownFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-name'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the cost breakdown Lambda function'
+    Value: !GetAtt CostBreakdownFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-arn'
+
+  ScheduleName:
+    Description: 'Name of the EventBridge schedule'
+    Value: !Ref DailyCostBreakdownSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-schedule-name'
+
+  EmailAddress:
+    Description: 'Email address for cost breakdown notifications'
+    Value: !Ref EmailAddress
+
+  TargetRegions:
+    Description: 'Regions being monitored for cost breakdown'
+    Value: !Join [',', !Ref TargetRegions]
+
+  StackName:
+    Description: 'Name of the CloudFormation stack'
+    Value: !Ref AWS::StackName
+
+  VpcConfigured:
+    Description: 'Whether Lambda is configured with VPC'
+    Value: !If [HasVpcConfig, 'Yes', 'No']
+
+  LogRetentionDays:
+    Description: 'CloudWatch log retention period in days'
+    Value: !Ref LogRetentionDays
+
+  KmsKeyConfigured:
+    Description: 'Whether KMS encryption is configured for logs'
+    Value: !If [HasKmsKey, 'Yes', 'No']
