@@ -2,6 +2,15 @@
 
 This project creates a Lambda function that generates daily AWS cost breakdowns and sends them via email using Amazon SES. The function is triggered automatically every morning at 07:00 UTC using Amazon EventBridge Scheduler to deliver the previous day's cost analysis.
 
+
+<img width="1418" height="591" alt="Screenshot 2026-01-02 at 19 49 05" src="https://github.com/user-attachments/assets/acda25ba-0ad2-40e6-8616-f4b6cb521e33" />
+
+
+
+<img width="1421" height="851" alt="Screenshot 2026-01-02 at 19 49 20" src="https://github.com/user-attachments/assets/9ac799df-c623-41ab-a466-9d40ded91133" />
+
+
+
 ## Architecture
 
 - **Lambda Function**: Fetches cost data from AWS Cost Explorer API and formats it into an email
