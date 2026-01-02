@@ -1,4 +1,0 @@
-# file: /Users/diogo/Documents/Cloud Automation Scripts/cost_manager.py
-# hypothesis_version: 6.141.1
-
-[0.0, '%Y-%m-%d', 'Amount', 'BlendedCost', 'Code', 'DAILY', 'DIMENSION', 'End', 'Error', 'Estimated', 'Groups', 'Key', 'Keys', 'Message', 'Metrics', 'ResultsByTime', 'SERVICE', 'Start', 'Total', 'Type', 'USD', 'Unit', 'ce', 'us-east-1']

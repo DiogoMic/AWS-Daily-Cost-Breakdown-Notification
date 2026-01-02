@@ -1,4 +1,0 @@
-# file: /Users/diogo/Documents/Cloud Automation Scripts/config.py
-# hypothesis_version: 6.141.1
-
-[',', 'AWS_REGION', 'EMAIL_RECIPIENTS', 'SENDER_EMAIL']
