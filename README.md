@@ -43,15 +43,12 @@ This project creates a Lambda function that generates daily AWS cost breakdowns 
 3. **SES Email Verification**: Your email address must be verified in Amazon SES
 4. **Cost Explorer Enabled**: Must be enabled in your AWS account
 
-### Optional
-- **AWS CDK** (if using CDK deployment method)
-- **Python 3.11+** (for local development/testing)
 
 ## Deployment Methods
 
-This solution can be deployed using either **CloudFormation** (recommended) or **AWS CDK**:
+This solution can be deployed using either **CloudFormation** or **AWS CLI**:
 
-### Method 1: CloudFormation (Recommended)
+###  CloudFormation Console
 
 #### Prerequisites for CloudFormation
 - AWS CLI installed and configured
@@ -63,7 +60,7 @@ This solution can be deployed using either **CloudFormation** (recommended) or *
 ```bash
 aws ses verify-email-identity --email-address your-email@example.com
 ```
-#### Manual CloudFormation Deployment
+#### CloudFormation Deployment
 
 **Via AWS Console:**
 1. Go to [CloudFormation Console](https://console.aws.amazon.com/cloudformation/)
